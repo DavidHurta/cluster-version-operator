@@ -13,8 +13,10 @@ import (
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
-	"github.com/thanos-io/thanos/pkg/promclient"
+	"github.com/prometheus/client_golang/api"
+	prometheusv1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -32,22 +34,29 @@ type PromQL struct {
 	kubeSvc    types.NamespacedName
 
 	// HTTPClientConfig holds the client configuration for connecting to the Prometheus service.
-	HTTPClientConfig httpconfig.ClientConfig
+	HTTPClientConfig config.HTTPClientConfig
 
 	// QueryTimeout limits the amount of time we wait before giving up on the Prometheus query.
 	QueryTimeout time.Duration
 }
 
 func NewPromQL(promqlTarget clusterconditions.PromQLTarget) *cache.Cache {
+	var auth *config.Authorization
+	if promqlTarget.BearerTokenFile != "" {
+		auth = &config.Authorization{
+			Type:            "Bearer",
+			CredentialsFile: promqlTarget.BearerTokenFile,
+		}
+	}
 	return &cache.Cache{
 		Condition: &PromQL{
 			kubeClient: promqlTarget.KubeClient,
 			useDNS:     promqlTarget.UseDNS,
 			url:        promqlTarget.URL,
 			kubeSvc:    promqlTarget.KubeSvc,
-			HTTPClientConfig: httpconfig.ClientConfig{
-				BearerTokenFile: promqlTarget.BearerTokenFile,
-				TLSConfig: httpconfig.TLSConfig{
+			HTTPClientConfig: config.HTTPClientConfig{
+				Authorization: auth,
+				TLSConfig: config.TLSConfig{
 					CAFile:     promqlTarget.CABundleFile,
 					ServerName: promqlTarget.URL.Hostname(),
 				},
@@ -90,6 +99,25 @@ func (p *PromQL) Valid(ctx context.Context, condition *configv1.ClusterCondition
 	return nil
 }
 
+type CustomRoundTripper struct {
+	rt http.RoundTripper
+}
+
+func (r *CustomRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPost {
+		err := req.ParseForm()
+		if err != nil {
+			return nil, err
+		}
+		req.URL.RawQuery = req.Form.Encode()
+		req, err = http.NewRequest(http.MethodGet, req.URL.String(), nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return r.rt.RoundTrip(req)
+}
+
 // Match returns true when the condition's PromQL evaluates to 1,
 // false when the PromQL evaluates to 0, and an error if the PromQL
 // returns no time series or returns a value besides 0 or 1.
@@ -101,13 +129,20 @@ func (p *PromQL) Match(ctx context.Context, condition *configv1.ClusterCondition
 		return false, fmt.Errorf("failure determine thanos IP: %w", err)
 	}
 	p.url.Host = host
+	clientConfig := api.Config{Address: p.url.String()}
 
-	client, err := httpconfig.NewHTTPClient(p.HTTPClientConfig, "")
+	if roundTripper, err := config.NewRoundTripperFromConfig(p.HTTPClientConfig, "cluster-conditions"); err == nil {
+		clientConfig.RoundTripper = &CustomRoundTripper{rt: roundTripper}
+	} else {
+		return false, fmt.Errorf("creating PromQL round-tripper: %w", err)
+	}
+
+	client, err := api.NewClient(clientConfig)
 	if err != nil {
 		return false, fmt.Errorf("creating PromQL client: %w", err)
 	}
 
-	v1api := promclient.NewClient(client, nil, "cluster-conditions")
+	v1api := prometheusv1.NewAPI(client)
 
 	queryContext := ctx
 	if p.QueryTimeout > 0 {
@@ -117,10 +152,7 @@ func (p *PromQL) Match(ctx context.Context, condition *configv1.ClusterCondition
 	}
 
 	klog.V(2).Infof("evaluate %s cluster condition: %q", condition.Type, condition.PromQL.PromQL)
-	opts := promclient.QueryOptions{
-		Method: http.MethodGet,
-	}
-	result, warnings, _, err := v1api.QueryInstant(queryContext, p.url, condition.PromQL.PromQL, time.Now(), opts)
+	result, warnings, err := v1api.Query(queryContext, condition.PromQL.PromQL, time.Now())
 	if err != nil {
 		return false, fmt.Errorf("executing PromQL query: %w", err)
 	}
@@ -129,11 +161,20 @@ func (p *PromQL) Match(ctx context.Context, condition *configv1.ClusterCondition
 		klog.Warning(warning)
 	}
 
-	if result.Len() != 1 {
-		return false, fmt.Errorf("invalid PromQL result length must be one, but is %d", result.Len())
+	if result.Type() != model.ValVector {
+		return false, fmt.Errorf("invalid PromQL result type is %s, not vector", result.Type())
 	}
 
-	sample := result[0]
+	vector, ok := result.(model.Vector)
+	if !ok {
+		return false, fmt.Errorf("invalid PromQL result type is nominally %s, but fails Vector cast", result.Type())
+	}
+
+	if vector.Len() != 1 {
+		return false, fmt.Errorf("invalid PromQL result length must be one, but is %d", vector.Len())
+	}
+
+	sample := vector[0]
 	if sample.Value == 0 {
 		return false, nil
 	} else if sample.Value == 1 {
