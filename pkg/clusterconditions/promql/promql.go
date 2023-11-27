@@ -7,9 +7,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	configv1 "github.com/openshift/api/config/v1"
@@ -99,23 +101,29 @@ func (p *PromQL) Valid(ctx context.Context, condition *configv1.ClusterCondition
 	return nil
 }
 
-type CustomRoundTripper struct {
-	rt http.RoundTripper
+// Type CustomClient encapsulates an API client interface.
+type CustomClient struct {
+	client api.Client
 }
 
-func (r *CustomRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+// Returns a response containing status code 501 for POST requests. All other requests are
+// propagated into the encapsulated API client interface inside the CustomClient object.
+// This is required due to the thanos-querier.openshift-monitoring.svc tenancy port.
+func (c *CustomClient) Do(ctx context.Context, req *http.Request) (*http.Response, []byte, error) {
 	if req.Method == http.MethodPost {
-		err := req.ParseForm()
-		if err != nil {
-			return nil, err
+		if req.Body != nil {
+			req.Body.Close() // Underlying RoundTripper is normally responsible to close the body
 		}
-		req.URL.RawQuery = req.Form.Encode()
-		req, err = http.NewRequest(http.MethodGet, req.URL.String(), nil)
-		if err != nil {
-			return nil, err
-		}
+		return &http.Response{
+			StatusCode: http.StatusNotImplemented,
+			Body:       io.NopCloser(strings.NewReader("")), // http.Response.Body must not nill as per documentation
+		}, nil, nil
 	}
-	return r.rt.RoundTrip(req)
+	return c.client.Do(ctx, req)
+}
+
+func (c *CustomClient) URL(ep string, args map[string]string) *url.URL {
+	return c.client.URL(ep, args)
 }
 
 // Match returns true when the condition's PromQL evaluates to 1,
@@ -132,14 +140,18 @@ func (p *PromQL) Match(ctx context.Context, condition *configv1.ClusterCondition
 	clientConfig := api.Config{Address: p.url.String()}
 
 	if roundTripper, err := config.NewRoundTripperFromConfig(p.HTTPClientConfig, "cluster-conditions"); err == nil {
-		clientConfig.RoundTripper = &CustomRoundTripper{rt: roundTripper}
+		clientConfig.RoundTripper = roundTripper
 	} else {
 		return false, fmt.Errorf("creating PromQL round-tripper: %w", err)
 	}
 
-	client, err := api.NewClient(clientConfig)
+	promqlClient, err := api.NewClient(clientConfig)
 	if err != nil {
 		return false, fmt.Errorf("creating PromQL client: %w", err)
+	}
+
+	client := &CustomClient{
+		client: promqlClient,
 	}
 
 	v1api := prometheusv1.NewAPI(client)
