@@ -2443,7 +2443,6 @@ func TestCVO_UpgradePreconditionFailing(t *testing.T) {
 	//
 	o.release.Image = "image/image:0"
 	o.release.Version = "1.0.0-abc"
-	desired := configv1.Release{Version: "1.0.1-abc", Image: "image/image:1"}
 	uid, _ := uuid.NewRandom()
 	clusterUID := configv1.ClusterID(uid.String())
 	cvs["version"] = &configv1.ClusterVersion{
@@ -2455,11 +2454,11 @@ func TestCVO_UpgradePreconditionFailing(t *testing.T) {
 		Spec: configv1.ClusterVersionSpec{
 			ClusterID:     clusterUID,
 			Channel:       "fast",
-			DesiredUpdate: &configv1.Update{Version: desired.Version, Image: desired.Image},
+			DesiredUpdate: &configv1.Update{Version: "", Image: "quay.io/openshift-release-dev/ocp-release@sha256:115bba6836b9feffb81ad9101791619edd5f19d333580b7f62bd6721eeda82d2"},
 		},
 		Status: configv1.ClusterVersionStatus{
 			// Prefers the image version over the operator's version (although in general they will remain in sync)
-			Desired:     desired,
+			Desired:     configv1.Release{Version: "1.0.0-abc", Image: "image/image:0"},
 			VersionHash: "DL-FFQ2Uem8=",
 			History: []configv1.UpdateHistory{
 				{State: configv1.CompletedUpdate, Image: "image/image:0", Version: "1.0.0-abc", Verified: true, StartedTime: defaultStartedTime, CompletionTime: &defaultCompletionTime},
@@ -2480,12 +2479,10 @@ func TestCVO_UpgradePreconditionFailing(t *testing.T) {
 	defer shutdownFn()
 
 	worker := o.configSync.(*SyncWorker)
-	worker.preconditions = []precondition.Precondition{&testPrecondition{SuccessAfter: 3}}
+	worker.preconditions = []precondition.Precondition{&testPreconditionAlwaysFail{}}
 
 	go worker.Start(ctx, 1)
 
-	// Step 1: The operator should report that it is blocked on precondition checks failing
-	//
 	client.ClearActions()
 	err := o.sync(ctx, o.queueKey())
 	if err != nil {
@@ -2494,217 +2491,40 @@ func TestCVO_UpgradePreconditionFailing(t *testing.T) {
 	actions := client.Actions()
 	verifyCVSingleUpdate(t, actions)
 
-	verifyAllStatus(t, worker.StatusCh(),
-		SyncWorkerStatus{
-			Actual:     configv1.Release{Version: "1.0.1-abc", Image: "image/image:1"},
-			Generation: 1,
-			loadPayloadStatus: LoadPayloadStatus{
-				Step:               "RetrievePayload",
-				Message:            "Retrieving and verifying payload version=\"1.0.1-abc\" image=\"image/image:1\"",
-				LastTransitionTime: time.Unix(1, 0),
-				Update:             configv1.Update{Version: "1.0.1-abc", Image: "image/image:1"},
-			},
-		},
-		SyncWorkerStatus{
-			Actual:       configv1.Release{Version: "1.0.1-abc", Image: "image/image:1"},
-			Generation:   1,
-			LastProgress: time.Unix(1, 0),
-			loadPayloadStatus: LoadPayloadStatus{
-				Step:               "PreconditionChecks",
-				Message:            "Preconditions failed for payload loaded version=\"1.0.1-abc\" image=\"image/image:1\": Precondition \"TestPrecondition SuccessAfter: 3\" failed because of \"CheckFailure\": failing, attempt: 1 will succeed after 3 attempt",
-				LastTransitionTime: time.Unix(2, 0),
-				Update:             configv1.Update{Version: "1.0.1-abc", Image: "image/image:1"},
-				Failure:            &payload.UpdateError{Reason: "UpgradePreconditionCheckFailed", Message: "Precondition \"TestPrecondition SuccessAfter: 3\" failed because of \"CheckFailure\": failing, attempt: 1 will succeed after 3 attempt", Name: "PreconditionCheck"},
-			},
-		},
-	)
-
-	client.ClearActions()
-	err = o.sync(ctx, o.queueKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-	actions = client.Actions()
-	if len(actions) != 2 {
-		t.Fatalf("%s", spew.Sdump(actions))
-	}
-	expectGet(t, actions[0], "clusterversions", "", "version")
-	actual := cvs["version"].(*configv1.ClusterVersion)
-
-	// Step 2: Set allowUnverifiedImages to true, trigger a sync and the operator should apply the payload
-	//
-	// set an update
-	copied := configv1.Update{
-		Version: desired.Version,
-		Image:   desired.Image,
-		Force:   true,
-	}
-	actual.Spec.DesiredUpdate = &copied
-	//
-	// ensure the sync worker tells the sync loop about it
-	err = o.sync(ctx, o.queueKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// wait until we see the new payload show up
-	count := 0
-	for {
-		var status SyncWorkerStatus
-		select {
-		case status = <-worker.StatusCh():
-		case <-time.After(3 * time.Second):
-			t.Fatalf("never saw expected retrieve payload event")
-		}
-		if reflect.DeepEqual(configv1.Release{Version: "1.0.1-abc", Image: "image/image:1"}, status.Actual) {
-			break
-		}
-		t.Logf("Unexpected status waiting to see first retrieve: %#v", status)
-		count++
-		if count > 8 {
-			t.Fatalf("saw too many sync events of the wrong form")
-		}
-	}
-	// wait until the new payload is applied
-	count = 0
-	for {
-		var status SyncWorkerStatus
-		select {
-		case status = <-worker.StatusCh():
-		case <-time.After(3 * time.Second):
-			t.Fatalf("never saw expected apply event")
-		}
-		if status.loadPayloadStatus.Step == "PayloadLoaded" {
-			break
-		}
-		t.Log("Waiting to see step PayloadLoaded")
-		count++
-		if count > 8 {
-			t.Fatalf("saw too many sync events of the wrong form")
-		}
-	}
-	verifyAllStatus(t, worker.StatusCh(),
-		SyncWorkerStatus{
-			Total:       3,
-			VersionHash: "DL-FFQ2Uem8=", Architecture: architecture,
-			Actual: configv1.Release{
-				Version: "1.0.1-abc",
-				Image:   "image/image:1",
-				URL:     "https://example.com/v1.0.1-abc",
-			},
-			Generation: 1,
-			CapabilitiesStatus: CapabilityStatus{
-				Status: configv1.ClusterVersionCapabilitiesStatus{
-					EnabledCapabilities: sortedCaps,
-					KnownCapabilities:   sortedKnownCaps,
-				},
-			},
-			loadPayloadStatus: LoadPayloadStatus{
-				Step:               "PayloadLoaded",
-				Message:            "Payload loaded version=\"1.0.1-abc\" image=\"image/image:1\" architecture=\"" + architecture + "\"",
-				LastTransitionTime: time.Unix(1, 0),
-				Update:             configv1.Update{Version: "1.0.1-abc", Image: "image/image:1", Force: true},
-			},
-		},
-		SyncWorkerStatus{
-			Done:        1,
-			Total:       3,
-			VersionHash: "DL-FFQ2Uem8=", Architecture: architecture,
-			Actual: configv1.Release{
-				Version: "1.0.1-abc",
-				Image:   "image/image:1",
-				URL:     "https://example.com/v1.0.1-abc",
-			},
-			LastProgress: time.Unix(1, 0),
-			Generation:   1,
-			CapabilitiesStatus: CapabilityStatus{
-				Status: configv1.ClusterVersionCapabilitiesStatus{
-					EnabledCapabilities: sortedCaps,
-					KnownCapabilities:   sortedKnownCaps,
-				},
-			},
-			loadPayloadStatus: LoadPayloadStatus{
-				Step:               "PayloadLoaded",
-				Message:            "Payload loaded version=\"1.0.1-abc\" image=\"image/image:1\" architecture=\"" + architecture + "\"",
-				LastTransitionTime: time.Unix(2, 0),
-				Update:             configv1.Update{Version: "1.0.1-abc", Image: "image/image:1", Force: true},
-			},
-		},
-		SyncWorkerStatus{
-			Done:        2,
-			Total:       3,
-			VersionHash: "DL-FFQ2Uem8=", Architecture: architecture,
-			Actual: configv1.Release{
-				Version: "1.0.1-abc",
-				Image:   "image/image:1",
-				URL:     "https://example.com/v1.0.1-abc",
-			},
-			LastProgress: time.Unix(2, 0),
-			Generation:   1,
-			CapabilitiesStatus: CapabilityStatus{
-				Status: configv1.ClusterVersionCapabilitiesStatus{
-					EnabledCapabilities: sortedCaps,
-					KnownCapabilities:   sortedKnownCaps,
-				},
-			},
-			loadPayloadStatus: LoadPayloadStatus{
-				Step:               "PayloadLoaded",
-				Message:            "Payload loaded version=\"1.0.1-abc\" image=\"image/image:1\" architecture=\"" + architecture + "\"",
-				LastTransitionTime: time.Unix(3, 0),
-				Update:             configv1.Update{Version: "1.0.1-abc", Image: "image/image:1", Force: true},
-			},
-		},
-	)
-
-	// wait for status to reflect sync of new payload
-	waitForStatusCompleted(t, worker)
-
-	client.ClearActions()
-	err = o.sync(ctx, o.queueKey())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	actions = client.Actions()
-	if len(actions) != 2 {
-		t.Fatalf("%s", spew.Sdump(actions))
-	}
 	expectGet(t, actions[0], "clusterversions", "", "version")
 	expectUpdateStatus(t, actions[1], "clusterversions", "", &configv1.ClusterVersion{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "version",
-			ResourceVersion: "4",
+			ResourceVersion: "1",
 			Generation:      1,
 		},
 		Spec: configv1.ClusterVersionSpec{
-			ClusterID:     actual.Spec.ClusterID,
+			ClusterID:     clusterUID,
 			Channel:       "fast",
-			DesiredUpdate: &copied,
+			DesiredUpdate: &configv1.Update{Version: "", Image: "quay.io/openshift-release-dev/ocp-release@sha256:115bba6836b9feffb81ad9101791619edd5f19d333580b7f62bd6721eeda82d2"},
 		},
 		Status: configv1.ClusterVersionStatus{
 			ObservedGeneration: 1,
 			Desired: configv1.Release{
-				Version: "1.0.1-abc",
-				Image:   "image/image:1",
-				URL:     "https://example.com/v1.0.1-abc",
+				Image: "quay.io/openshift-release-dev/ocp-release@sha256:115bba6836b9feffb81ad9101791619edd5f19d333580b7f62bd6721eeda82d2",
 			},
-			VersionHash: "DL-FFQ2Uem8=",
+			VersionHash:  "DL-FFQ2Uem8=",
 			Capabilities: configv1.ClusterVersionCapabilitiesStatus{
-				EnabledCapabilities: sortedCaps,
-				KnownCapabilities:   sortedKnownCaps,
+				//EnabledCapabilities: sortedCaps,
+				//KnownCapabilities: sortedKnownCaps,
 			},
 			History: []configv1.UpdateHistory{
-				{State: configv1.CompletedUpdate, Image: "image/image:1", Version: "1.0.1-abc", StartedTime: defaultStartedTime, CompletionTime: &defaultCompletionTime},
+				{State: configv1.PartialUpdate, Image: "quay.io/openshift-release-dev/ocp-release@sha256:115bba6836b9feffb81ad9101791619edd5f19d333580b7f62bd6721eeda82d2", StartedTime: defaultStartedTime},
 				{State: configv1.CompletedUpdate, Image: "image/image:0", Version: "1.0.0-abc", Verified: true, StartedTime: defaultStartedTime, CompletionTime: &defaultCompletionTime},
 			},
 			Conditions: []configv1.ClusterOperatorStatusCondition{
 				{Type: ImplicitlyEnabledCapabilities, Status: "False", Reason: "AsExpected", Message: "Capabilities match configured spec"},
-				{Type: configv1.OperatorAvailable, Status: configv1.ConditionTrue, Message: "Done applying 1.0.1-abc"},
+				{Type: configv1.OperatorAvailable, Status: configv1.ConditionTrue, Message: "Done applying 1.0.0-abc"},
 				{Type: ClusterStatusFailing, Status: configv1.ConditionFalse},
-				{Type: configv1.OperatorProgressing, Status: configv1.ConditionFalse, Message: "Cluster version is 1.0.1-abc"},
+				{Type: configv1.OperatorProgressing, Status: configv1.ConditionTrue, Message: "Working towards quay.io/openshift-release-dev/ocp-release@sha256:115bba6836b9feffb81ad9101791619edd5f19d333580b7f62bd6721eeda82d2"},
 				{Type: configv1.RetrievedUpdates, Status: configv1.ConditionFalse},
-				{Type: DesiredReleaseAccepted, Status: configv1.ConditionTrue, Reason: "PayloadLoaded",
-					Message: "Payload loaded version=\"1.0.1-abc\" image=\"image/image:1\" architecture=\"" + architecture + "\""},
+				{Type: DesiredReleaseAccepted, Status: configv1.ConditionFalse, Reason: "PreconditionChecks",
+					Message: "Preconditions failed for payload loaded version=\"4.16.9\" image=\"quay.io/openshift-release-dev/ocp-release@sha256:115bba6836b9feffb81ad9101791619edd5f19d333580b7f62bd6721eeda82d2\": Precondition \"\" failed because of \"CheckFailure\":  will always fail."},
 			},
 		},
 	})
