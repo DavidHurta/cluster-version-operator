@@ -678,6 +678,7 @@ func (optr *Operator) sync(ctx context.Context, key string) error {
 
 	// identify the desired next version
 	desired, ok := findUpdateFromConfig(config, optr.getArchitecture())
+	// `desired` is spec.desiredUpdate
 	if ok {
 		klog.V(2).Infof("Desired version from spec is %#v", desired)
 	} else {
@@ -711,7 +712,8 @@ func (optr *Operator) sync(ctx context.Context, key string) error {
 	}
 
 	// inform the config sync loop about our desired state
-	status := optr.configSync.Update(ctx, config.Generation, desired, config, state)
+	status := optr.configSync.Update(ctx, config.Generation, desired, config, state) // `desired` from spec.desiredUpdate
+	// status.Actual now contains spec.desiredUpdate
 
 	optr.SetArchitecture(status.Architecture)
 

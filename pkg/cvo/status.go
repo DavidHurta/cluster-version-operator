@@ -156,6 +156,7 @@ func mergeOperatorHistory(cvStatus *configv1.ClusterVersionStatus, desired confi
 	// Prune least informative history entry when at maxHistory.
 	cvStatus.History = prune(cvStatus.History, MaxHistory)
 
+	// cvStatus.Desired is now... spec.desiredUpdate
 	cvStatus.Desired = desired
 }
 
@@ -199,12 +200,15 @@ func (optr *Operator) syncStatus(ctx context.Context, original, config *configv1
 		original = config.DeepCopy()
 	}
 
+	// status.Actual contains work.Desired which is spec.desiredUpdate
 	updateClusterVersionStatus(&config.Status, status, optr.release, optr.getAvailableUpdates, optr.enabledFeatureGates, validationErrs)
+	// config is now broken and contains spec.desiredUpdate in status.Desired
 
 	if klog.V(6).Enabled() {
 		klog.Infof("Apply config: %s", diff.ObjectReflectDiff(original, config))
 	}
 	updated, err := applyClusterVersionStatus(ctx, optr.client.ConfigV1(), config, original)
+	// cvStatus is now applied
 	optr.rememberLastUpdate(updated)
 	return err
 }
@@ -221,7 +225,9 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 
 	now := metav1.Now()
 	version := versionStringFromRelease(status.Actual)
+	// status.Actual now contains work.Desired which is spec.desiredUpdate
 	if status.Actual.Image == release.Image {
+		// images are not the same - this does not pass
 		// backfill any missing information from the operator (payload).
 		if status.Actual.Version == "" {
 			status.Actual.Version = release.Version
@@ -233,14 +239,19 @@ func updateClusterVersionStatus(cvStatus *configv1.ClusterVersionStatus, status 
 			status.Actual.Channels = append(release.Channels[:0:0], release.Channels...) // copy
 		}
 	}
+
 	desired := mergeReleaseMetadata(status.Actual, getAvailableUpdates)
+	// desired is now status.Actual which contains work.Desired which is spec.desiredUpdate
 
 	risksMsg := ""
 	if desired.Image == status.loadPayloadStatus.Update.Image {
 		risksMsg = status.loadPayloadStatus.AcceptedRisks
 	}
 
+	// desired is still ... spec.desiredUpdate
 	mergeOperatorHistory(cvStatus, desired, status.Verified, now, status.Completed > 0, risksMsg, status.loadPayloadStatus.Local)
+	// mergeOperatorHistory generates "must add a new history entry completed..."
+	// cvStatus is now broken and contains spec.desiredUpdate in status.Desired
 
 	cvStatus.Capabilities = status.CapabilitiesStatus.Status
 

@@ -48,6 +48,8 @@ func (p *Rollback) Run(ctx context.Context, releaseContext precondition.ReleaseC
 	}
 
 	currentVersion, err := semver.Parse(cv.Status.Desired.Version)
+	// SECOND RUN: cv.Status.Desired.Version is now empty from the FIRST RUN
+	// NonBlockingWarning gets set to true due InvalidCurrentVersion ,
 	if err != nil {
 		return &precondition.Error{
 			Nested:             err,

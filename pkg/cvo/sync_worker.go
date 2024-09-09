@@ -263,6 +263,8 @@ func (w *SyncWorker) syncPayload(ctx context.Context, work *SyncWork) ([]configv
 		Image:   work.Desired.Image,
 		Force:   work.Desired.Force,
 	}
+	// work.Desired is spec.desiredUpdate
+	// desired is thus spec.desiredUpdate
 	klog.V(2).Infof("syncPayload: %s (force=%t)", versionStringFromUpdate(desired), work.Desired.Force)
 
 	// cache the payload until the release image changes
@@ -324,6 +326,7 @@ func (w *SyncWorker) syncPayload(ctx context.Context, work *SyncWork) ([]configv
 
 		// Capability filtering is not done here since unknown capabilities are allowed
 		// during updated payload load and enablement checking only occurs during apply.
+		// desired is spec.desiredUpdate
 		payloadUpdate, err := payload.LoadUpdate(info.Directory, desired.Image, w.exclude, string(w.requiredFeatureSet), w.clusterProfile, nil)
 
 		if err != nil {
@@ -385,6 +388,7 @@ func (w *SyncWorker) syncPayload(ctx context.Context, work *SyncWork) ([]configv
 						Update:             desired,
 						LastTransitionTime: time.Now(),
 					})
+					// FIRST RUN: WE END HERE - Rollback precondition fails as blocking
 					return nil, err
 				} else {
 					w.eventRecorder.Eventf(cvoObjectRef, corev1.EventTypeWarning, "PreconditionWarn", "precondition warning for payload loaded version=%q image=%q: %v", desired.Version, desired.Image, err)
@@ -416,6 +420,7 @@ func (w *SyncWorker) syncPayload(ctx context.Context, work *SyncWork) ([]configv
 			Update:             desired,
 			LastTransitionTime: time.Now(),
 		})
+		// SECOND RUN: PayloadLoaded
 		klog.V(2).Infof("Payload loaded from %s with hash %s, architecture %s", desired.Image, payloadUpdate.ManifestHash,
 			payloadUpdate.Architecture)
 	}
@@ -450,7 +455,7 @@ func (w *SyncWorker) Update(ctx context.Context, generation int64, desired confi
 
 	work := &SyncWork{
 		Generation: generation,
-		Desired:    desired,
+		Desired:    desired, // work.Desired is now spec.desiredUpdate
 		Overrides:  config.Spec.Overrides,
 	}
 
@@ -496,12 +501,14 @@ func (w *SyncWorker) Update(ctx context.Context, generation int64, desired confi
 	// update is invoked
 	var oldDesired *configv1.Update
 	if w.work == nil {
+		// w.work is nil; we have just started
+		// w.status.Actual gets set with a wrong value
 		work.State = state
 		w.status.Generation = generation
 		w.status.Reconciling = state.Reconciling()
-		w.status.Actual = configv1.Release{
-			Version: work.Desired.Version,
-			Image:   work.Desired.Image,
+		w.status.Actual = configv1.Release{ // w.status.Actual is now work.Desired which is spec.desiredUpdate
+			Version: work.Desired.Version, // Version gets set "" because the spec.desiredUpdate.Image is empty
+			Image:   work.Desired.Image,   // spec.desiredUpdate.Image gets set
 		}
 	} else {
 		oldDesired = &w.work.Desired
@@ -517,13 +524,17 @@ func (w *SyncWorker) Update(ctx context.Context, generation int64, desired confi
 	}
 
 	implicit, err := w.loadUpdatedPayload(ctx, work)
+	// FIRST RUN: the above will return an error (e.g. "loadUpdatedPayload syncPayload err=Multiple precondition checks failed:...")
+	// SECOND RUN: Preconditions will pass
 	if err != nil {
+		// FIRST RUN: err != nil, we end here
 		// save override and capability changes if not first time through
 		if w.work != nil {
 			w.work.Overrides = config.Spec.Overrides
 			w.work.Capabilities = work.Capabilities
 			w.status.CapabilitiesStatus.Status = capability.GetCapabilitiesStatus(w.work.Capabilities)
 		}
+		// w.status.Actual contains work.Desired which is spec.desiredUpdate - this is returned
 		return w.status.DeepCopy()
 	}
 
@@ -532,6 +543,7 @@ func (w *SyncWorker) Update(ctx context.Context, generation int64, desired confi
 	}
 
 	// update work to include desired version now that it has been successfully loaded
+	// SECOND RUN: NEW UPDATE STARTS
 	w.work = work
 
 	// Update capabilities settings and status to include any capabilities that were implicitly enabled due
@@ -552,6 +564,7 @@ func (w *SyncWorker) Update(ctx context.Context, generation int64, desired confi
 	msg := "new work is available"
 	select {
 	case w.startApply <- msg:
+		// SECOND RUN: Sync worker is notified - update will proceed
 		klog.V(2).Info("Notify the sync worker that new work is available")
 	default:
 		klog.V(2).Info("The sync worker has already been notified that new work is available")
