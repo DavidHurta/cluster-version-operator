@@ -31,6 +31,9 @@ import (
 	clientset "github.com/openshift/client-go/config/clientset/versioned"
 	configinformersv1 "github.com/openshift/client-go/config/informers/externalversions/config/v1"
 	configlistersv1 "github.com/openshift/client-go/config/listers/config/v1"
+	operatorclientset "github.com/openshift/client-go/operator/clientset/versioned"
+	operatorinformersv1alpha1 "github.com/openshift/client-go/operator/informers/externalversions/operator/v1alpha1"
+	operatorlistersv1alpha1 "github.com/openshift/client-go/operator/listers/operator/v1alpha1"
 	"github.com/openshift/library-go/pkg/manifest"
 	"github.com/openshift/library-go/pkg/verify"
 	"github.com/openshift/library-go/pkg/verify/store"
@@ -93,9 +96,10 @@ type Operator struct {
 	// releaseCreated, if set, is the timestamp of the current update.
 	releaseCreated time.Time
 
-	client        clientset.Interface
-	kubeClient    kubernetes.Interface
-	eventRecorder record.EventRecorder
+	client         clientset.Interface
+	operatorClient operatorclientset.Interface
+	kubeClient     kubernetes.Interface
+	eventRecorder  record.EventRecorder
 
 	// minimumUpdateCheckInterval is the minimum duration to check for updates from
 	// the update service.
@@ -112,12 +116,13 @@ type Operator struct {
 	// spec.
 	updateService string
 
-	cvLister              configlistersv1.ClusterVersionLister
-	coLister              configlistersv1.ClusterOperatorLister
-	cmConfigLister        listerscorev1.ConfigMapNamespaceLister
-	cmConfigManagedLister listerscorev1.ConfigMapNamespaceLister
-	proxyLister           configlistersv1.ProxyLister
-	cacheSynced           []cache.InformerSynced
+	cvLister               configlistersv1.ClusterVersionLister
+	coLister               configlistersv1.ClusterOperatorLister
+	cvoConfigurationLister operatorlistersv1alpha1.ClusterVersionOperatorLister
+	cmConfigLister         listerscorev1.ConfigMapNamespaceLister
+	cmConfigManagedLister  listerscorev1.ConfigMapNamespaceLister
+	proxyLister            configlistersv1.ProxyLister
+	cacheSynced            []cache.InformerSynced
 
 	// queue tracks applying updates to a cluster.
 	queue workqueue.TypedRateLimitingInterface[any]
@@ -125,6 +130,8 @@ type Operator struct {
 	availableUpdatesQueue workqueue.TypedRateLimitingInterface[any]
 	// upgradeableQueue tracks checking for upgradeable.
 	upgradeableQueue workqueue.TypedRateLimitingInterface[any]
+	// configurationQueue tracks checking for configuration.
+	configurationQueue workqueue.TypedRateLimitingInterface[any]
 
 	// statusLock guards access to modifying available updates
 	statusLock       sync.Mutex
@@ -190,8 +197,10 @@ func New(
 	cmConfigInformer informerscorev1.ConfigMapInformer,
 	cmConfigManagedInformer informerscorev1.ConfigMapInformer,
 	proxyInformer configinformersv1.ProxyInformer,
+	cvoInformer operatorinformersv1alpha1.ClusterVersionOperatorInformer,
 	client clientset.Interface,
 	kubeClient kubernetes.Interface,
+	operatorClient operatorclientset.Interface,
 	exclude string,
 	clusterProfile string,
 	promqlTarget clusterconditions.PromQLTarget,
@@ -219,10 +228,12 @@ func New(
 
 		client:                client,
 		kubeClient:            kubeClient,
+		operatorClient:        operatorClient,
 		eventRecorder:         eventBroadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: namespace}),
 		queue:                 workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "clusterversion"}),
 		availableUpdatesQueue: workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "availableupdates"}),
 		upgradeableQueue:      workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "upgradeable"}),
+		configurationQueue:    workqueue.NewTypedRateLimitingQueueWithConfig[any](workqueue.DefaultTypedControllerRateLimiter[any](), workqueue.TypedRateLimitingQueueConfig[any]{Name: "configuration"}),
 
 		exclude:                   exclude,
 		clusterProfile:            clusterProfile,
@@ -248,12 +259,18 @@ func New(
 	if _, err := coInformer.Informer().AddEventHandler(optr.clusterOperatorEventHandler()); err != nil {
 		return nil, err
 	}
+	if _, err := cvoInformer.Informer().AddEventHandler(optr.clusterVersionOperatorEventHandler()); err != nil {
+		return nil, err
+	}
 
 	optr.coLister = coInformer.Lister()
 	optr.cacheSynced = append(optr.cacheSynced, coInformer.Informer().HasSynced)
 
 	optr.cvLister = cvInformer.Lister()
 	optr.cacheSynced = append(optr.cacheSynced, cvInformer.Informer().HasSynced)
+
+	optr.cvoConfigurationLister = cvoInformer.Lister()
+	optr.cacheSynced = append(optr.cacheSynced, cvoInformer.Informer().HasSynced)
 
 	optr.proxyLister = proxyInformer.Lister()
 	optr.cmConfigLister = cmConfigInformer.Lister().ConfigMaps(internal.ConfigNamespace)
@@ -450,6 +467,15 @@ func (optr *Operator) Run(runContext context.Context, shutdownContext context.Co
 	go func() {
 		defer utilruntime.HandleCrash()
 		wait.UntilWithContext(runContext, func(runContext context.Context) {
+			optr.worker(runContext, optr.configurationQueue, optr.configurationSync)
+		}, time.Second)
+		resultChannel <- asyncResult{name: "cvo configuration"}
+	}()
+
+	resultChannelCount++
+	go func() {
+		defer utilruntime.HandleCrash()
+		wait.UntilWithContext(runContext, func(runContext context.Context) {
 			optr.worker(runContext, optr.upgradeableQueue, optr.upgradeableSyncFunc(false))
 		}, time.Second)
 		resultChannel <- asyncResult{name: "upgradeable"}
@@ -542,6 +568,26 @@ func (optr *Operator) clusterVersionEventHandler() cache.ResourceEventHandler {
 		},
 		DeleteFunc: func(_ interface{}) {
 			optr.queue.Add(workQueueKey)
+		},
+	}
+}
+
+// clusterOperatorEventHandler queues an update for the cluster version on any change to the given object.
+// Callers should use this with an informer.
+func (optr *Operator) clusterVersionOperatorEventHandler() cache.ResourceEventHandler {
+	workQueueKey := optr.queueKey()
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(_ interface{}) {
+			optr.configurationQueue.Add(workQueueKey)
+			klog.V(internal.Debug).Infof("ClusterVersionOperator resource was added; queuing a configuration sync")
+		},
+		UpdateFunc: func(_, _ interface{}) {
+			optr.configurationQueue.Add(workQueueKey)
+			klog.V(internal.Debug).Infof("ClusterVersionOperator resource was modified; queuing a configuration sync")
+		},
+		DeleteFunc: func(_ interface{}) {
+			optr.configurationQueue.Add(workQueueKey)
+			klog.V(internal.Debug).Infof("ClusterVersionOperator resource was deleted; queuing a configuration sync")
 		},
 	}
 }
@@ -772,6 +818,23 @@ func (optr *Operator) upgradeableSyncFunc(ignoreThrottlePeriod bool) func(_ cont
 
 		return optr.syncUpgradeable(config, ignoreThrottlePeriod)
 	}
+}
+
+func (optr *Operator) configurationSync(ctx context.Context, _ string) error {
+	startTime := time.Now()
+	klog.V(2).Infof("Started syncing CVO configuration")
+	defer func() {
+		klog.V(2).Infof("Finished syncing CVO configuration (%v)", time.Since(startTime))
+	}()
+
+	config, err := optr.cvoConfigurationLister.Get(ClusterVersionOperatorConfigurationName)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return optr.syncConfiguration(ctx, config)
 }
 
 // isOlderThanLastUpdate returns true if the cluster version is older than
