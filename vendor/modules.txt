@@ -183,7 +183,7 @@ github.com/openshift/api/image/v1
 github.com/openshift/api/operator/v1
 github.com/openshift/api/operator/v1alpha1
 github.com/openshift/api/security/v1
-# github.com/openshift/client-go v0.0.0-20241107164952-923091dd2b1a
+# github.com/openshift/client-go v0.0.0-20241217083110-35abaf51555b
 ## explicit; go 1.22.0
 github.com/openshift/client-go/config/applyconfigurations
 github.com/openshift/client-go/config/applyconfigurations/config/v1
