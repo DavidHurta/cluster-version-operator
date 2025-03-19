@@ -63,6 +63,7 @@ type Options struct {
 	ServingKeyFile  string
 
 	Kubeconfig string
+	ConfigFile string
 	NodeName   string
 	ListenAddr string
 
@@ -511,6 +512,7 @@ func (o *Options) NewControllerContext(cb *ClientBuilder, alwaysEnableCapabiliti
 		o.PromQLTarget,
 		o.InjectClusterIdIntoPromQL,
 		o.UpdateService,
+		o.ConfigFile,
 		alwaysEnableCapabilities,
 	)
 	if err != nil {
