@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -18,14 +19,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
 
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/cluster-version-operator/lib/resourcemerge"
 	"github.com/openshift/cluster-version-operator/pkg/internal"
+	"github.com/openshift/library-go/pkg/authorization/hardcodedauthorizer"
 	"github.com/openshift/library-go/pkg/crypto"
 
 	"gopkg.in/fsnotify.v1"
@@ -128,8 +134,12 @@ type asyncResult struct {
 }
 
 func createHttpServer() *http.Server {
+	auth := hardcodedauthorizer.NewHardCodedMetricsAuthorizer()
+	scheme := runtime.NewScheme()
+	metav1.AddToGroupVersion(scheme, metav1.SchemeGroupVersion)
+
 	handler := http.NewServeMux()
-	handler.Handle("/metrics", promhttp.Handler())
+	handler.Handle("/metrics", filters.WithAuthorization(promhttp.Handler(), auth, serializer.NewCodecFactory(scheme)))
 	server := &http.Server{
 		Handler: handler,
 	}
@@ -181,11 +191,11 @@ func handleServerResult(result asyncResult, lastLoopError error) error {
 // Also detects changes to metrics certificate files upon which
 // the metrics HTTP server is shutdown and recreated with a new
 // TLS configuration.
-func RunMetrics(runContext context.Context, shutdownContext context.Context, listenAddress, certFile, keyFile string) error {
+func RunMetrics(runContext context.Context, shutdownContext context.Context, listenAddress, certFile, keyFile, clientCAFile string) error {
 	var tlsConfig *tls.Config
 	if listenAddress != "" {
 		var err error
-		tlsConfig, err = makeTLSConfig(certFile, keyFile)
+		tlsConfig, err = makeTLSConfig(certFile, keyFile, clientCAFile)
 		if err != nil {
 			return fmt.Errorf("Failed to create TLS config: %w", err)
 		}
@@ -201,6 +211,7 @@ func RunMetrics(runContext context.Context, shutdownContext context.Context, lis
 
 	certDir := filepath.Dir(certFile)
 	keyDir := filepath.Dir(keyFile)
+	clientCADir := filepath.Dir(clientCAFile)
 
 	origCertChecksum, err := checksumFile(certFile)
 	if err != nil {
@@ -209,6 +220,14 @@ func RunMetrics(runContext context.Context, shutdownContext context.Context, lis
 	origKeyChecksum, err := checksumFile(keyFile)
 	if err != nil {
 		return fmt.Errorf("Failed to initialize key file checksum: %w", err)
+	}
+
+	var origClientCAChecksum []byte
+	if clientCAFile != "" {
+		origClientCAChecksum, err = checksumFile(clientCAFile)
+		if err != nil {
+			return fmt.Errorf("Failed to initialize client CA file checksum: %w", err)
+		}
 	}
 
 	// Set up and start the file watcher.
@@ -223,6 +242,11 @@ func RunMetrics(runContext context.Context, shutdownContext context.Context, lis
 		if certDir != keyDir {
 			if err := watcher.Add(keyDir); err != nil {
 				return fmt.Errorf("Failed to add %v to watcher: %w", keyDir, err)
+			}
+		}
+		if clientCAFile != "" && certDir != clientCADir && keyDir != clientCADir {
+			if err := watcher.Add(clientCADir); err != nil {
+				return fmt.Errorf("Failed to add %v to watcher: %w", clientCADir, err)
 			}
 		}
 	}
@@ -255,7 +279,7 @@ func RunMetrics(runContext context.Context, shutdownContext context.Context, lis
 				loopError = handleServerResult(result, loopError)
 			case event := <-watcher.Events:
 				if event.Op != fsnotify.Chmod && event.Op != fsnotify.Remove {
-					if changed, err := certsChanged(origCertChecksum, origKeyChecksum, certFile, keyFile); changed {
+					if changed, err := certsChanged(origCertChecksum, origKeyChecksum, origClientCAChecksum, certFile, keyFile, clientCAFile); changed {
 
 						// Update file checksums with latest files.
 						//
@@ -269,8 +293,15 @@ func RunMetrics(runContext context.Context, shutdownContext context.Context, lis
 							loopError = err
 							break
 						}
+						if clientCAFile != "" {
+							if origClientCAChecksum, err = checksumFile(clientCAFile); err != nil {
+								klog.Errorf("Failed to update client CA file checksum: %v", err)
+								loopError = err
+								break
+							}
+						}
 
-						tlsConfig, err = makeTLSConfig(certFile, keyFile)
+						tlsConfig, err = makeTLSConfig(certFile, keyFile, clientCAFile)
 						if err == nil {
 							restartServer = true
 							shutdownHttpServer(shutdownContext, server)
@@ -641,7 +672,7 @@ func mostRecentTimestamp(cv *configv1.ClusterVersion) int64 {
 // Determine if the certificates have changed and need to be updated.
 // If no errors occur, returns true if both files have changed and
 // neither is an empty file. Otherwise returns false and any error.
-func certsChanged(origCertChecksum []byte, origKeyChecksum []byte, certFile, keyFile string) (bool, error) {
+func certsChanged(origCertChecksum, origKeyChecksum, origClientCAChecksum []byte, certFile, keyFile, clientCAFile string) (bool, error) {
 	// Check if both files exist.
 	certNotEmpty, err := fileExistsAndNotEmpty(certFile)
 	if err != nil {
@@ -651,9 +682,16 @@ func certsChanged(origCertChecksum []byte, origKeyChecksum []byte, certFile, key
 	if err != nil {
 		return false, fmt.Errorf("Error checking if changed TLS key file empty/exists: %w", err)
 	}
-	if !certNotEmpty || !keyNotEmpty {
+	clientCANotEmpty := true
+	if clientCAFile != "" {
+		clientCANotEmpty, err = fileExistsAndNotEmpty(clientCAFile)
+		if err != nil {
+			return false, fmt.Errorf("Error checking if changed client CA file empty/exists: %w", err)
+		}
+	}
+	if !certNotEmpty || !keyNotEmpty || !clientCANotEmpty {
 		// One of the files is missing despite some file event.
-		return false, fmt.Errorf("Certificate or key is missing or empty, certificates will not be rotated.")
+		return false, fmt.Errorf("Certificate, key, or client CA is missing or empty, certificates will not be rotated.")
 	}
 
 	currentCertChecksum, err := checksumFile(certFile)
@@ -666,8 +704,20 @@ func certsChanged(origCertChecksum []byte, origKeyChecksum []byte, certFile, key
 		return false, fmt.Errorf("Error checking key file checksum: %w", err)
 	}
 
+	certChanged := !bytes.Equal(origCertChecksum, currentCertChecksum)
+	keyChanged := !bytes.Equal(origKeyChecksum, currentKeyChecksum)
+	clientCAChanged := false
+
+	if clientCAFile != "" {
+		currentClientCAChecksum, err := checksumFile(keyFile)
+		if err != nil {
+			return false, fmt.Errorf("Error checking key client CA checksum: %w", err)
+		}
+		clientCAChanged = !bytes.Equal(origClientCAChecksum, currentClientCAChecksum)
+	}
+
 	// Check if the non-empty certificate/key files have actually changed.
-	if !bytes.Equal(origCertChecksum, currentCertChecksum) && !bytes.Equal(origKeyChecksum, currentKeyChecksum) {
+	if (certChanged && keyChanged) || clientCAChanged {
 		klog.V(2).Info("Certificate and key changed. Will recreate metrics server with updated TLS configuration.")
 		return true, nil
 	}
@@ -675,7 +725,7 @@ func certsChanged(origCertChecksum []byte, origKeyChecksum []byte, certFile, key
 	return false, nil
 }
 
-func makeTLSConfig(servingCertFile, servingKeyFile string) (*tls.Config, error) {
+func makeTLSConfig(servingCertFile, servingKeyFile, clientCAFile string) (*tls.Config, error) {
 	// Load the initial certificate contents.
 	certBytes, err := os.ReadFile(servingCertFile)
 	if err != nil {
@@ -690,11 +740,29 @@ func makeTLSConfig(servingCertFile, servingKeyFile string) (*tls.Config, error) 
 		return nil, err
 	}
 
-	return crypto.SecureTLSConfig(&tls.Config{
+	config := &tls.Config{
 		GetCertificate: func(_ *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return &certificate, nil
 		},
-	}), nil
+	}
+
+	// Require and verify client's certification if client CA file is provided
+	if clientCAFile != "" {
+		clientCABytes, err := os.ReadFile(clientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read client CA file: %w", err)
+		}
+
+		clientCAPool := x509.NewCertPool()
+		if !clientCAPool.AppendCertsFromPEM(clientCABytes) {
+			return nil, fmt.Errorf("failed to parse client CA certificate")
+		}
+
+		config.ClientCAs = clientCAPool
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	return crypto.SecureTLSConfig(config), nil
 }
 
 // Compute the sha256 checksum for file 'fName' returning any error.
