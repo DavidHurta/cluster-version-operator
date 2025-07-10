@@ -36,6 +36,7 @@ spec:
         - "--serving-key-file=/etc/tls/serving-cert/tls.key"
         - "--v=2"
         - "--always-enable-capabilities=Ingress"
+        - "--client-ca-file=/etc/tls/client/client-ca-file"
         ports:
         - name: metrics
           containerPort: 9099
@@ -56,6 +57,9 @@ spec:
           readOnly: true
         - mountPath: /etc/tls/service-ca
           name: service-ca
+          readOnly: true
+        - mountPath: /etc/tls/client
+          name: metrics-client-ca
           readOnly: true
         - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
           name: kube-api-access
@@ -113,6 +117,9 @@ spec:
       - name: service-ca
         configMap:
           name: openshift-service-ca.crt
+      - name: metrics-client-ca
+        configMap:
+          name: metrics-client-ca
       - name: kube-api-access
         projected:
           defaultMode: 420
