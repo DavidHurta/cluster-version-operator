@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/endpoints/filters"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -192,16 +193,68 @@ func handleServerResult(result asyncResult, lastLoopError error) error {
 // the metrics HTTP server is shutdown and recreated with a new
 // TLS configuration.
 func RunMetrics(runContext context.Context, shutdownContext context.Context, listenAddress, certFile, keyFile, clientCAFile string) error {
-	var tlsConfig *tls.Config
-	if listenAddress != "" {
-		var err error
-		tlsConfig, err = makeTLSConfig(certFile, keyFile, clientCAFile)
-		if err != nil {
-			return fmt.Errorf("Failed to create TLS config: %w", err)
-		}
-	} else {
+	if listenAddress == "" {
 		return errors.New("TLS configuration is required to serve metrics")
 	}
+
+	// Poll until all required files exist and are not empty
+	klog.Info("Waiting for required certificate files to exist and be non-empty...")
+	err := wait.PollUntilContextCancel(runContext, 30*time.Second, true, func(ctx context.Context) (bool, error) {
+		// Check if cert file exists and is not empty
+		certExists, err := fileExistsAndNotEmpty(certFile)
+		if err != nil {
+			klog.Errorf("Error checking certificate file %s: %v", certFile, err)
+			return false, nil // Continue polling despite error
+		}
+
+		// Check if key file exists and is not empty
+		keyExists, err := fileExistsAndNotEmpty(keyFile)
+		if err != nil {
+			klog.Errorf("Error checking key file %s: %v", keyFile, err)
+			return false, nil // Continue polling despite error
+		}
+
+		// Check if client CA file exists and is not empty (if specified)
+		clientCAExists := true
+		if clientCAFile != "" {
+			clientCAExists, err = fileExistsAndNotEmpty(clientCAFile)
+			if err != nil {
+				klog.Errorf("Error checking client CA file %s: %v", clientCAFile, err)
+				return false, nil // Continue polling despite error
+			}
+		}
+
+		// If all required files exist and are not empty, we're done
+		if certExists && keyExists && clientCAExists {
+			klog.Info("All required certificate files are now available and non-empty")
+			return true, nil
+		}
+
+		// Log what we're still waiting for
+		var missing []string
+		if !certExists {
+			missing = append(missing, "cert file")
+		}
+		if !keyExists {
+			missing = append(missing, "key file")
+		}
+		if !clientCAExists {
+			missing = append(missing, "client CA file")
+		}
+		klog.Infof("Still waiting for: %v", missing)
+
+		return false, nil // Continue polling
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to wait for certificate files: %w", err)
+	}
+
+	tlsConfig, err := makeTLSConfig(certFile, keyFile, clientCAFile)
+	if err != nil {
+		return fmt.Errorf("Failed to create TLS config: %w", err)
+	}
+
 	server := createHttpServer()
 
 	resultChannel := make(chan asyncResult, 1)
