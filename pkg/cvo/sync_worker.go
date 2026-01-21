@@ -295,6 +295,18 @@ func (w *SyncWorker) syncPayload(ctx context.Context, work *SyncWork) ([]configv
 
 	// cache the payload until the release image changes
 	validPayload := w.payload
+
+	previousEnabledFeatureGates := w.status.EnabledFeatureGates
+	if !work.EnabledFeatureGates.Equal(previousEnabledFeatureGates) {
+		// When the feature gates change, we must reload the payload.
+		// Loading the payload filters out files that didn't match the previous set of feature gates,
+		// this means now, additional files may match the new set of feature gates and need to be included.
+		// Some files in the current payload may no longer match the new set of feature gates and need to be excluded,
+		// though these ones are already excluded when apply calls Include on the manifests.
+		klog.V(2).Infof("Enabled feature gates changed from %v to %v, forcing a payload refresh", previousEnabledFeatureGates, work.EnabledFeatureGates)
+		w.payload = nil
+	}
+
 	if validPayload != nil && validPayload.Release.Image == desired.Image {
 
 		// reset payload status to currently loaded payload if it no longer applies to desired target
@@ -651,14 +663,11 @@ func (w *SyncWorker) Start(ctx context.Context, maxWorkers int) {
 
 			if featureGatesChanged {
 				// When the feature gates change, we must reload the payload.
-				// Loading the payload fiters out files that didn't match the previous set of feature gates,
+				// Loading the payload filters out files that didn't match the previous set of feature gates,
 				// this means now, additional files may match the new set of feature gates and need to be included.
 				// Some files in the current payload may no longer match the new set of feature gates and need to be excluded,
 				// though these ones are already excluded when apply calls Include on the manifests.
 				klog.V(2).Infof("Feature gates changed, loading updated payload")
-
-				// Clear the payload to force a reload.
-				w.payload = nil
 
 				_, err := w.loadUpdatedPayload(ctx, w.work)
 				if err != nil {
