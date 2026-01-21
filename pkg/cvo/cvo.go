@@ -1119,7 +1119,9 @@ func (optr *Operator) featureGateEventHandler() cache.ResourceEventHandler {
 	}
 }
 
-// updateEnabledFeatureGates updates the cluster feature gates based on a FeatureGate object
+// updateEnabledFeatureGates updates the cluster feature gates based on a FeatureGate object.
+// Returns true or false based on whether or not the gates were actually updated.
+// This allows us to avoid unnecessary work if the gates have not changed.
 func (optr *Operator) updateEnabledFeatureGates(obj interface{}) bool {
 	featureGate, ok := obj.(*configv1.FeatureGate)
 	if !ok {
