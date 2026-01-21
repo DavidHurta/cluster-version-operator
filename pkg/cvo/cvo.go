@@ -1163,8 +1163,12 @@ func (optr *Operator) getEnabledFeatureGates() sets.Set[string] {
 
 // extractEnabledGates extracts the list of enabled feature gates for the current cluster version
 func (optr *Operator) extractEnabledGates(featureGate *configv1.FeatureGate) sets.Set[string] {
-	// Find the feature gate details for the current cluster version
-	currentVersion := optr.enabledCVOFeatureGates.DesiredVersion()
+	// Find the feature gate details for the current loaded payload version.
+	currentVersion := optr.currentVersion().Version
+	if currentVersion == "" {
+		klog.Warningf("Payload has not been initialized yet, using the operator version %s", optr.enabledCVOFeatureGates.DesiredVersion())
+		currentVersion = optr.enabledCVOFeatureGates.DesiredVersion()
+	}
 
 	return featuregates.ExtractEnabledGates(featureGate, currentVersion)
 }
