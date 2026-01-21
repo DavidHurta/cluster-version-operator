@@ -3,6 +3,8 @@ package featuregates
 import (
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/api/features"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/klog/v2"
 )
 
 // StubOpenShiftVersion is the default OpenShift version placeholder for the purpose of determining
@@ -109,6 +111,32 @@ func CvoGatesFromFeatureGate(gate *configv1.FeatureGate, version string) CvoGate
 				enabledGates.cvoConfiguration = false
 			}
 		}
+	}
+
+	return enabledGates
+}
+
+// ExtractEnabledGates extracts the list of enabled feature gates for a given version from a FeatureGate object
+// and returns a set of feature gate names.
+// If no matching version is found, it returns an empty set.
+func ExtractEnabledGates(featureGate *configv1.FeatureGate, currentVersion string) sets.Set[string] {
+	enabledGates := sets.Set[string]{}
+
+	// Find the feature gate details for the current cluster version
+	for _, details := range featureGate.Status.FeatureGates {
+		if details.Version == currentVersion {
+			for _, enabled := range details.Enabled {
+				enabledGates.Insert(string(enabled.Name))
+			}
+			klog.V(4).Infof("Found %d enabled feature gates for version %s: %v",
+				enabledGates.Len(), currentVersion, sets.List(enabledGates))
+			break
+		}
+	}
+
+	// If no matching version found, log a warning but continue with empty set
+	if enabledGates.Len() == 0 {
+		klog.V(2).Infof("No feature gates found for current version %s, using empty set", currentVersion)
 	}
 
 	return enabledGates

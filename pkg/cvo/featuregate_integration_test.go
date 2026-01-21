@@ -169,8 +169,8 @@ func TestFeatureGateEventHandling(t *testing.T) {
 		},
 	}
 
-	// Initialize feature gates
-	optr.initializeFeatureGates()
+	// Initialize feature gates to empty.
+	optr.updateEnabledFeatureGates(&configv1.FeatureGate{})
 
 	// Test that initial state is empty
 	gates := optr.getEnabledFeatureGates()

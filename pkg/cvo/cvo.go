@@ -235,6 +235,7 @@ func New(
 	alwaysEnableCapabilities []configv1.ClusterVersionCapability,
 	featureSet configv1.FeatureSet,
 	cvoGates featuregates.CvoGateChecker,
+	startingEnabledManifestFeatureGates sets.Set[string],
 ) (*Operator, error) {
 	eventBroadcaster := record.NewBroadcaster()
 	eventBroadcaster.StartLogging(klog.Infof)
@@ -268,8 +269,9 @@ func New(
 		conditionRegistry:         standard.NewConditionRegistry(promqlTarget),
 		injectClusterIdIntoPromQL: injectClusterIdIntoPromQL,
 
-		requiredFeatureSet:     featureSet,
-		enabledCVOFeatureGates: cvoGates,
+		requiredFeatureSet:          featureSet,
+		enabledCVOFeatureGates:      cvoGates,
+		enabledManifestFeatureGates: startingEnabledManifestFeatureGates,
 
 		alwaysEnableCapabilities: alwaysEnableCapabilities,
 	}
@@ -302,9 +304,6 @@ func New(
 
 	optr.featureGateLister = featureGateInformer.Lister()
 	optr.cacheSynced = append(optr.cacheSynced, featureGateInformer.Informer().HasSynced)
-
-	// Initialize cluster feature gates
-	optr.initializeFeatureGates()
 
 	// make sure this is initialized after all the listers are initialized
 	optr.upgradeableChecks = optr.defaultUpgradeableChecks()
@@ -1120,16 +1119,6 @@ func (optr *Operator) featureGateEventHandler() cache.ResourceEventHandler {
 	}
 }
 
-// initializeFeatureGates initializes the cluster feature gates from the current FeatureGate object
-func (optr *Operator) initializeFeatureGates() {
-	// Try to load initial state from the cluster FeatureGate object
-	if optr.featureGateLister != nil {
-		if featureGate, err := optr.featureGateLister.Get("cluster"); err == nil {
-			optr.updateEnabledFeatureGates(featureGate)
-		}
-	}
-}
-
 // updateEnabledFeatureGates updates the cluster feature gates based on a FeatureGate object
 func (optr *Operator) updateEnabledFeatureGates(obj interface{}) bool {
 	featureGate, ok := obj.(*configv1.FeatureGate)
@@ -1174,27 +1163,10 @@ func (optr *Operator) getEnabledFeatureGates() sets.Set[string] {
 
 // extractEnabledGates extracts the list of enabled feature gates for the current cluster version
 func (optr *Operator) extractEnabledGates(featureGate *configv1.FeatureGate) sets.Set[string] {
-	enabledGates := sets.Set[string]{}
-
 	// Find the feature gate details for the current cluster version
 	currentVersion := optr.enabledCVOFeatureGates.DesiredVersion()
-	for _, details := range featureGate.Status.FeatureGates {
-		if details.Version == currentVersion {
-			for _, enabled := range details.Enabled {
-				enabledGates.Insert(string(enabled.Name))
-			}
-			klog.V(4).Infof("Found %d enabled feature gates for version %s: %v",
-				enabledGates.Len(), currentVersion, sets.List(enabledGates))
-			break
-		}
-	}
 
-	// If no matching version found, log a warning but continue with empty set
-	if enabledGates.Len() == 0 {
-		klog.V(2).Infof("No feature gates found for current version %s, using empty set", currentVersion)
-	}
-
-	return enabledGates
+	return featuregates.ExtractEnabledGates(featureGate, currentVersion)
 }
 
 // shouldReconcileCVOConfiguration returns whether the CVO should reconcile its configuration using the API server.
