@@ -268,6 +268,9 @@ func (o *Options) processInitialFeatureGate(ctx context.Context, configInformerF
 	case apierrors.IsNotFound(err):
 		// if we have no featuregates, then the cluster is using the default featureset, which is "".
 		// This excludes everything that could possibly depend on a different feature set.
+		// Any manifest that blocks on a feature gate will be excluded from the cluster in this case.
+		// Since manifests roll-up to the default feature set over time, this should be safe and we will bring in
+		// the additional manifests once the feature gates become available.
 		startingFeatureSet = ""
 		klog.Infof("FeatureGate not found in cluster, will assume default feature set %q at startup", startingFeatureSet)
 	case err != nil:
