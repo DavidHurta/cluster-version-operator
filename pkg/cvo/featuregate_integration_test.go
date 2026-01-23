@@ -22,7 +22,7 @@ func TestFeatureGateManifestFiltering(t *testing.T) {
 			name:         "include manifest with matching feature gate",
 			enabledGates: sets.New[string]("TechPreviewFeatureGate"),
 			manifestAnnotations: map[string]string{
-				"release.openshift.io/feature-gates": "TechPreviewFeatureGate",
+				"release.openshift.io/feature-gate": "TechPreviewFeatureGate",
 			},
 			shouldInclude: true,
 		},
@@ -30,7 +30,7 @@ func TestFeatureGateManifestFiltering(t *testing.T) {
 			name:         "exclude manifest with disabled feature gate",
 			enabledGates: sets.New[string]("SomeOtherGate"),
 			manifestAnnotations: map[string]string{
-				"release.openshift.io/feature-gates": "TechPreviewFeatureGate",
+				"release.openshift.io/feature-gate": "TechPreviewFeatureGate",
 			},
 			shouldInclude: false,
 			expectedError: "feature gate TechPreviewFeatureGate is required but not enabled",
@@ -39,7 +39,7 @@ func TestFeatureGateManifestFiltering(t *testing.T) {
 			name:         "include manifest when exclusion gate is disabled",
 			enabledGates: sets.New[string]("TechPreviewFeatureGate"),
 			manifestAnnotations: map[string]string{
-				"release.openshift.io/feature-gates": "-DisabledFeature",
+				"release.openshift.io/feature-gate": "-DisabledFeature",
 			},
 			shouldInclude: true,
 		},
@@ -47,7 +47,7 @@ func TestFeatureGateManifestFiltering(t *testing.T) {
 			name:         "exclude manifest when exclusion gate is enabled",
 			enabledGates: sets.New[string]("DisabledFeature"),
 			manifestAnnotations: map[string]string{
-				"release.openshift.io/feature-gates": "-DisabledFeature",
+				"release.openshift.io/feature-gate": "-DisabledFeature",
 			},
 			shouldInclude: false,
 			expectedError: "feature gate DisabledFeature is enabled but manifest requires it to be disabled",
@@ -56,7 +56,7 @@ func TestFeatureGateManifestFiltering(t *testing.T) {
 			name:         "complex filtering - AND logic",
 			enabledGates: sets.New[string]("FeatureA"),
 			manifestAnnotations: map[string]string{
-				"release.openshift.io/feature-gates": "FeatureA,-FeatureB",
+				"release.openshift.io/feature-gate": "FeatureA,-FeatureB",
 			},
 			shouldInclude: true,
 		},
@@ -64,7 +64,7 @@ func TestFeatureGateManifestFiltering(t *testing.T) {
 			name:         "complex filtering - failed AND logic",
 			enabledGates: sets.New[string]("FeatureA", "FeatureB"),
 			manifestAnnotations: map[string]string{
-				"release.openshift.io/feature-gates": "FeatureA,-FeatureB",
+				"release.openshift.io/feature-gate": "FeatureA,-FeatureB",
 			},
 			shouldInclude: false,
 			expectedError: "feature gate FeatureB is enabled but manifest requires it to be disabled",
@@ -136,7 +136,7 @@ func TestSyncWorkIntegration(t *testing.T) {
 		},
 	}
 	testObj.SetAnnotations(map[string]string{
-		"release.openshift.io/feature-gates": "TestGate1",
+		"release.openshift.io/feature-gate": "TestGate1",
 	})
 
 	manifest := &manifest.Manifest{
@@ -150,7 +150,7 @@ func TestSyncWorkIntegration(t *testing.T) {
 
 	// Test with a gate that's not enabled
 	manifest.Obj.SetAnnotations(map[string]string{
-		"release.openshift.io/feature-gates": "DisabledGate",
+		"release.openshift.io/feature-gate": "DisabledGate",
 	})
 
 	err = manifest.Include(nil, nil, nil, nil, nil, work.EnabledFeatureGates)
@@ -255,7 +255,7 @@ func TestManifestFilteringExamples(t *testing.T) {
 			}
 			// Use SetAnnotations to ensure proper annotation handling
 			obj.SetAnnotations(map[string]string{
-				"release.openshift.io/feature-gates": example.manifestAnnotation,
+				"release.openshift.io/feature-gate": example.manifestAnnotation,
 			})
 
 			manifest := &manifest.Manifest{
